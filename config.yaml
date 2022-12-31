@@ -1,0 +1,9 @@
+listen: 127.0.0.1:8888
+jobs:
+  google:
+    type: tls
+    addr: www.google.com:443
+    interval: 1m
+  cloudflare:
+    type: tcp
+    addr: 1.1.1.1:443
