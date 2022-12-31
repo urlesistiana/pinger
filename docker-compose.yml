@@ -1,0 +1,12 @@
+version: "3"
+
+services:
+  pinger:
+    build: https://github.com/urlesistiana/pinger.git
+    container_name: pinger
+    network_mode: bridge
+    ports:
+      - "8888:8888/tcp"
+    volumes:
+      - /etc/pinger:/etc/pinger
+    restart: unless-stopped
