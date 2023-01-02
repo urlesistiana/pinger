@@ -3,6 +3,7 @@ version: "3"
 services:
   pinger:
     build: https://github.com/urlesistiana/pinger.git
+    command: pinger watcher -c /etc/pinger/config.yaml
     container_name: pinger
     network_mode: bridge
     ports:
@@ -10,3 +11,8 @@ services:
     volumes:
       - /etc/pinger:/etc/pinger
     restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: 1m
+        max-file: 5

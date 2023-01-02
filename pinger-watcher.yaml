@@ -1,0 +1,16 @@
+listen: 127.0.0.1:8888  # metrics http server
+jobs:
+  cloudflare:           # job name
+    type: tcp           # ping type, one of {udp|tcp|cmd}
+    addr: 1.1.1.1:443   # target ip:port address
+    interval: 1m        # ping interval, default is 1m
+    auth: ""            # udp ping auth password, optional
+
+    exec: ""            # cmd ping executable
+    args:               # cmd ping args
+      - ""
+  my_server:
+    type: udp
+    addr: 127.0.0.1:48330
+    auth: my_passwd
+    interval: 100ms
