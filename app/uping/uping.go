@@ -50,37 +50,13 @@ func ping(a *args) {
 	ua, err := net.ResolveUDPAddr("udp", a.target)
 	if err != nil {
 		fmt.Printf("failed to resolve address %s, %s\n", a.target, err)
-		return
+		os.Exit(1)
 	}
 	addr := ua.AddrPort()
 
 	fmt.Printf("pinging %s\n", ua)
-	stats := new(stats)
-
-	mainDone := make(chan struct{})
-	go func() {
-		sc := make(chan os.Signal, 1)
-		signal.Notify(sc, os.Interrupt, syscall.SIGTERM)
-		select {
-		case <-sc:
-		case <-mainDone:
-		}
-		sent, received, lost, avg := stats.summary()
-		lostPercent := (float64(lost) / float64(sent)) * 100
-		fmt.Printf(
-			"summary: packets: sent = %d, received = %d, lost = %d (%.1f%% loss), avg = %dms",
-			sent,
-			received,
-			lost,
-			lostPercent,
-			avg.Milliseconds(),
-		)
-		os.Exit(0)
-	}()
-
 	authHeader := udp_pinger.AuthBytes(a.auth)
 	p := udp_pinger.New()
-
 	if a.flood {
 		a.interval = time.Millisecond * 20
 	}
@@ -88,34 +64,84 @@ func ping(a *args) {
 		a.times = math.MaxInt
 	}
 	ticker := time.NewTicker(a.interval)
-	wg := new(sync.WaitGroup)
-	for i := 0; i < a.times; i++ {
-		<-ticker.C
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-			defer cancel()
-			stats.sendInc()
-			d, err := p.Ping(ctx, authHeader, addr)
-			if err != nil {
-				if !a.flood {
-					fmt.Printf("#%d failure: %s\n", i, err)
-				} else {
-					print(".")
-				}
-			} else {
-				stats.observe(d)
-				if !a.flood {
-					fmt.Printf("#%d reply received latency=%.3fms\n", i, float64(d)/1e6)
-				}
+	pingWg := new(sync.WaitGroup)
+	stats := new(stats)
+	stopPingLoop := make(chan struct{})
+	pingWg.Add(1)
+	go func() {
+		defer pingWg.Done()
+	pingLoop:
+		for i := 0; i < a.times; i++ {
+			select {
+			case <-stopPingLoop:
+				break pingLoop
+			case <-ticker.C:
+				i := i
+				pingWg.Add(1)
+				go func() {
+					defer pingWg.Done()
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+					defer cancel()
+					stats.sendInc()
+					d, err := p.Ping(ctx, authHeader, addr)
+					if err != nil {
+						if !a.flood {
+							fmt.Printf("#%d failure: %s\n", i, err)
+						} else {
+							print(".")
+						}
+					} else {
+						stats.observe(d)
+						if !a.flood {
+							fmt.Printf("#%d reply received latency=%.3fms\n", i, float64(d)/1e6)
+						}
+					}
+				}()
 			}
-		}()
+		}
+	}()
+	pingLoopDone := make(chan struct{})
+	go func() {
+		pingWg.Wait()
+		close(pingLoopDone)
+	}()
+
+	sc := make(chan os.Signal, 1)
+	signal.Notify(sc, os.Interrupt, syscall.SIGTERM)
+	select {
+	case sig := <-sc: // interrupted
+		close(stopPingLoop) // stop sending
+		// Wait more 500ms to receive more replies.
+		// Otherwise, some replies will be "lost" if its request was just sent.
+		fmt.Printf("received signal: %s, exiting\n", sig)
+		wait := time.NewTimer(time.Millisecond * 500)
+		select {
+		case <-wait.C:
+		case <-pingLoopDone:
+		}
+	case <-pingLoopDone:
 	}
-	wg.Wait()
-	close(mainDone)
-	select {}
+
+	sm := stats.summary()
+	var lostPercentage float64
+	if sm.sent == 0 {
+		lostPercentage = 0
+	} else {
+		lostPercentage = (float64(sm.sent-sm.received) / float64(sm.sent)) * 100
+	}
+	fmt.Printf(
+		"summary: packets: sent = %d, received = %d, lost = %d (%.1f%% loss)\n",
+		sm.sent,
+		sm.received,
+		sm.sent-sm.received,
+		lostPercentage,
+	)
+	fmt.Printf("rtt: min = %.3fms, max = %.3fms, avg = %.3fms\n",
+		float64(sm.min)/1e6,
+		float64(sm.max)/1e6,
+		float64(sm.avg)/1e6,
+	)
+	os.Exit(0)
 }
 
 type stats struct {
@@ -136,17 +162,37 @@ func (s *stats) observe(d time.Duration) {
 	s.r = append(s.r, d)
 }
 
-func (s *stats) summary() (int, int, int, time.Duration) {
+type summary struct {
+	sent     int
+	received int
+	min      time.Duration
+	max      time.Duration
+	avg      time.Duration
+}
+
+func (s *stats) summary() summary {
+	var sm summary
 	s.m.Lock()
 	defer s.m.Unlock()
+
+	sm.sent = s.sent
+	sm.received = len(s.r)
+
 	var sum time.Duration
 	for _, d := range s.r {
-		if d >= 0 {
-			sum += d
+		sum += d
+		if sm.min == 0 || d < sm.min {
+			sm.min = d
+		}
+		if d > sm.max {
+			sm.max = d
 		}
 	}
-	success := len(s.r)
-	failure := s.sent - success
-	avg := sum / time.Duration(success)
-	return len(s.r), success, failure, avg
+
+	if len(s.r) == 0 {
+		sm.avg = 0
+	} else {
+		sm.avg = sum / time.Duration(len(s.r))
+	}
+	return sm
 }
