@@ -2,7 +2,6 @@ package watcher
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -13,15 +12,13 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
-	"os/exec"
 	"os/signal"
 	"pinger/app"
-	"strings"
+	"pinger/pkg/udp_pinger"
+	"sync"
 
 	"pinger/pkg/mlog"
-	"pinger/pkg/udp_pinger"
 	"syscall"
-	"time"
 )
 
 func init() {
@@ -49,18 +46,117 @@ type args struct {
 
 var logger = mlog.L()
 
-type Config struct {
-	Listen string               `yaml:"listen"`
-	Jobs   map[string]JobConfig `yaml:"jobs"`
+type Watcher struct {
+	pc *udp_pinger.PingConn
+
+	m    sync.Mutex
+	jobs map[string]*jobRunner
+
+	// metrics
+	latencyVac    *prometheus.HistogramVec
+	errorTotalVac *prometheus.CounterVec
 }
 
-type JobConfig struct {
-	Type     string        `yaml:"type"`
-	Addr     string        `yaml:"addr"`
-	Auth     string        `yaml:"auth"`
-	Exec     string        `yaml:"exec"`
-	Args     []string      `yaml:"args"`
-	Interval time.Duration `yaml:"interval"`
+type WatcherOpts struct {
+	Conn           *net.UDPConn // required
+	LatencyBuckets []float64    // default is defaultBuckets
+}
+
+var (
+	defaultBuckets = []float64{0.005, 0.01, 0.02, 0.04, 0.06, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.75, 1, 2}
+)
+
+func NewWatcher(opts WatcherOpts) *Watcher {
+	if opts.Conn == nil {
+		panic("watcher: nil udp conn")
+	}
+
+	buckets := opts.LatencyBuckets
+	if len(buckets) == 0 {
+		buckets = defaultBuckets
+	}
+
+	labels := []string{"job"}
+	return &Watcher{
+		pc: udp_pinger.NewPingConn(opts.Conn),
+
+		jobs: make(map[string]*jobRunner),
+		latencyVac: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "latency_seconds",
+			Help:    "The ping latency in second",
+			Buckets: buckets,
+		}, labels),
+		errorTotalVac: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "error_total",
+			Help: "The total number of pings failed",
+		}, labels),
+	}
+}
+
+func (w *Watcher) AddJob(name string, jc JobConfig, updateIfExisted bool) error {
+	w.m.Lock()
+	defer w.m.Unlock()
+
+	if oldJob, dup := w.jobs[name]; dup {
+		if updateIfExisted {
+			oldJob.stop()
+		} else {
+			return fmt.Errorf("failed to start job, duplicated job name %s", name)
+		}
+	}
+
+	j, err := w.runJob(name, jc)
+	if err != nil {
+		return fmt.Errorf("failed to start job, %w", err)
+	}
+	w.jobs[name] = j
+	return nil
+}
+
+func (w *Watcher) DelJob(name string) bool {
+	w.m.Lock()
+	defer w.m.Unlock()
+
+	if jr := w.jobs[name]; jr != nil {
+		jr.stop()
+		delete(w.jobs, name)
+		lb := prometheus.Labels{"job": name}
+		w.latencyVac.Delete(lb)
+		w.errorTotalVac.Delete(lb)
+		return true
+	}
+	return false
+}
+
+func (w *Watcher) DelAllJobs() {
+	w.m.Lock()
+	defer w.m.Unlock()
+
+	for name, jr := range w.jobs {
+		jr.stop()
+		delete(w.jobs, name)
+		lb := prometheus.Labels{"job": name}
+		w.latencyVac.Delete(lb)
+		w.errorTotalVac.Delete(lb)
+	}
+}
+
+func (w *Watcher) RegisterTo(r prometheus.Registerer) error {
+	if err := r.Register(w.latencyVac); err != nil {
+		return err
+	}
+	if err := r.Register(w.errorTotalVac); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *Watcher) runJob(name string, jc JobConfig) (*jobRunner, error) {
+	addr, err := netip.ParseAddrPort(jc.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid address, %w", err)
+	}
+	return w.newJobRunner(name, jc.Interval, jc.Timeout, NewPingJob(w.pc, addr, jc.Auth)), nil
 }
 
 func run(a *args) {
@@ -69,7 +165,30 @@ func run(a *args) {
 		logger.Fatal("failed to load config", zap.Error(err))
 	}
 
-	s := newMetricsServer()
+	udpConn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		logger.Fatal("failed to open socket", zap.Error(err))
+	}
+	defer udpConn.Close()
+
+	w := NewWatcher(WatcherOpts{
+		Conn: udpConn,
+	})
+
+	for name, jc := range c.Jobs {
+		err := w.AddJob(name, jc, false)
+		if err != nil {
+			logger.Fatal("failed to start job", zap.String("name", name), zap.Error(err))
+		}
+	}
+
+	r := prometheus.NewRegistry()
+	if err := w.RegisterTo(prometheus.WrapRegistererWithPrefix("pinger_watcher_", r)); err != nil {
+		logger.Fatal("failed to register metrics", zap.Error(err))
+	}
+	s := &http.Server{
+		Handler: promhttp.HandlerFor(r, promhttp.HandlerOpts{}),
+	}
 	l, err := net.Listen("tcp", c.Listen)
 	if err != nil {
 		logger.Fatal("failed to listen on socket", zap.Error(err))
@@ -84,67 +203,12 @@ func run(a *args) {
 		}
 	}()
 
-	var js []*job
-	for name, jc := range c.Jobs {
-		j, err := runJob(name, jc)
-		if err != nil {
-			logger.Fatal("failed to start job", zap.String("job", name), zap.Error(err))
-		}
-		js = append(js, j)
-	}
-	logger.Info("watcher is started", zap.Int("started_jobs", len(js)))
-
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, os.Interrupt, syscall.SIGTERM)
 	sig := <-sc
 	logger.Info("watcher is exiting", zap.Stringer("signal", sig))
-	for _, j := range js {
-		j.close()
-	}
+	w.DelAllJobs()
 	_ = s.Close()
-}
-
-var pinger = udp_pinger.New()
-
-func runJob(name string, jc JobConfig) (*job, error) {
-	addr, err := netip.ParseAddrPort(jc.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid address, %w", err)
-	}
-
-	var pingFunc func() (time.Duration, error)
-	switch jc.Type {
-	case "tcp":
-		pingFunc = newTCPPingFunc(addr)
-	case "udp":
-		authHeader := udp_pinger.AuthBytes(jc.Auth)
-		pingFunc = func() (time.Duration, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-			defer cancel()
-			return pinger.Ping(ctx, authHeader, addr)
-		}
-	case "cmd":
-		pingFunc = func() (time.Duration, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, jc.Exec, jc.Args...)
-			buf := new(bytes.Buffer)
-			cmd.Stdout = buf
-			if err := cmd.Run(); err != nil {
-				return 0, err
-			}
-			res := buf.String()
-			res = strings.TrimSpace(res)
-			d, err := time.ParseDuration(res)
-			if err != nil {
-				return 0, fmt.Errorf("invalid stdout result [%s], %w", res, err)
-			}
-			return d, nil
-		}
-	default:
-		return nil, fmt.Errorf("invalid job type %s", jc.Type)
-	}
-	return newJob(name, jc.Interval, pingFunc), nil
 }
 
 func loadConfig(s string) (*Config, error) {
@@ -160,25 +224,4 @@ func loadConfig(s string) (*Config, error) {
 		return nil, fmt.Errorf("failed to decode yaml, %w", err)
 	}
 	return c, nil
-}
-
-func newMetricsServer() *http.Server {
-	r := prometheus.NewRegistry()
-	prometheus.WrapRegistererWithPrefix("pinger_", r).MustRegister(latencyVac)
-	s := &http.Server{
-		Handler: promhttp.HandlerFor(r, promhttp.HandlerOpts{}),
-	}
-	return s
-}
-
-func newTCPPingFunc(addr netip.AddrPort) func() (time.Duration, error) {
-	return func() (time.Duration, error) {
-		start := time.Now()
-		c, err := net.DialTCP("tcp", nil, net.TCPAddrFromAddrPort(addr))
-		if err != nil {
-			return 0, err
-		}
-		defer c.Close()
-		return time.Since(start), nil
-	}
 }

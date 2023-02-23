@@ -28,18 +28,10 @@ pinger watcher -c pinger-watcher.yaml
 listen: 127.0.0.1:8888  # metrics http server
 jobs:
   cloudflare:           # job name
-    type: tcp           # ping type, one of {udp|tcp|cmd}
     addr: 1.1.1.1:443   # target ip:port address
     interval: 1m        # ping interval, default is 1m
     auth: ""            # udp ping auth password, optional
-
-    exec: ""            # cmd ping executable
-    args:               # cmd ping args
-      - ""
 ```
-
-- tcp ping 即常见的 tcp syn ack ping。
-- cmd ping 会执行外部命令 `exec args...`。外部命令需将延时结果输出至 stdout 。示例: `53ms`, `0.053s` 。
 
 输出以下 prometheus metrics:
 

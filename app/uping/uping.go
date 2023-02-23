@@ -55,8 +55,16 @@ func ping(a *args) {
 	addr := ua.AddrPort()
 
 	fmt.Printf("pinging %s\n", ua)
-	authHeader := udp_pinger.AuthBytes(a.auth)
-	p := udp_pinger.New()
+
+	uc, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		fmt.Printf("failed to open socket, %s\n", err)
+		os.Exit(1)
+	}
+	pc := udp_pinger.NewPingConn(uc)
+
+	ag := udp_pinger.AuthGenerator{Key: udp_pinger.Key32(a.auth)}
+
 	if a.flood {
 		a.interval = time.Millisecond * 20
 	}
@@ -83,7 +91,7 @@ func ping(a *args) {
 					ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 					defer cancel()
 					stats.sendInc()
-					d, err := p.Ping(ctx, authHeader, addr)
+					d, err := pc.Ping(ctx, addr, ag.PutAuthHeader)
 					if err != nil {
 						if !a.flood {
 							fmt.Printf("#%d failure: %s\n", i, err)

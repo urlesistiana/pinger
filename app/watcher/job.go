@@ -1,48 +1,65 @@
 package watcher
 
 import (
+	"context"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"io"
 	"pinger/pkg/mlog"
 	"sync"
 	"time"
 )
 
-type job struct {
+type Job interface {
+	Ping(ctx context.Context) (time.Duration, error)
+	io.Closer
+}
+
+type jobRunner struct {
+	job Job
+
 	logger     *zap.Logger
-	pingFunc   func() (time.Duration, error)
-	ob         prometheus.Observer
+	latencyOb  prometheus.Observer
 	errCounter prometheus.Counter
 
 	closeOnce   sync.Once
 	closeNotify chan struct{}
 }
 
-func newJob(name string, interval time.Duration, pingFunc func() (time.Duration, error)) *job {
+func (w *Watcher) newJobRunner(name string, interval, timeout time.Duration, j Job) *jobRunner {
 	lb := prometheus.Labels{"job": name}
-	j := &job{
+	jr := &jobRunner{
+		job: j,
+
 		logger:      mlog.L().With(zap.String("job", name)),
-		pingFunc:    pingFunc,
-		ob:          latencyVac.With(lb),
-		errCounter:  errorTotalVac.With(lb),
+		latencyOb:   w.latencyVac.With(lb),
+		errCounter:  w.errorTotalVac.With(lb),
 		closeOnce:   sync.Once{},
 		closeNotify: make(chan struct{}),
 	}
-	go j.pingLoop(interval)
-	return j
+	go jr.pingLoop(interval, timeout)
+	return jr
 }
 
-func (j *job) close() {
+func (j *jobRunner) stop() {
 	j.closeOnce.Do(func() {
 		close(j.closeNotify)
+		_ = j.job.Close()
 	})
 }
 
-func (j *job) pingLoop(interval time.Duration) {
-	const defaultInterval = time.Minute
+func (j *jobRunner) pingLoop(interval, timeout time.Duration) {
+	const (
+		defaultInterval = time.Minute
+		defaultTimeout  = time.Second * 5
+	)
 	if interval <= 0 {
 		interval = defaultInterval
 	}
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -50,13 +67,15 @@ func (j *job) pingLoop(interval time.Duration) {
 		select {
 		case <-ticker.C:
 			go func() {
-				d, err := j.pingFunc()
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				defer cancel()
+				d, err := j.job.Ping(ctx)
 				if err != nil {
 					j.logger.Warn("ping err", zap.Error(err))
 					j.errCounter.Inc()
 				} else {
 					j.logger.Info("ping successfully", zap.Duration("latency", d))
-					j.ob.Observe(d.Seconds())
+					j.latencyOb.Observe(d.Seconds())
 				}
 			}()
 		case <-j.closeNotify:

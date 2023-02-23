@@ -1,31 +1,28 @@
 package udp_pinger
 
 import (
-	"bytes"
 	"net"
 )
 
 // Server starts a ping pinger-server at uc.
 // It always returns an error.
-func Server(uc *net.UDPConn, auth string) error {
-	authHeader := AuthBytes(auth)
-	readBuf := make([]byte, 1480)
+func Server(uc *net.UDPConn, headerChecker func([]byte) error) error {
+	b := make([]byte, packetLen)
 	for {
-		n, addr, err := uc.ReadFromUDPAddrPort(readBuf)
+		n, addr, err := uc.ReadFromUDPAddrPort(b)
 		if err != nil {
 			if n != 0 {
 				continue // fragment error
 			}
 			return err
 		}
-		b := readBuf[:n]
-
-		if len(b) < 16 {
-			continue // invalid auth length
+		if n != packetLen {
+			continue // invalid length
 		}
-		if !bytes.Equal(b[:16], authHeader[:]) {
+
+		if checkErr := headerChecker(b[:headerLen]); checkErr != nil {
 			continue // invalid auth
 		}
-		_, _ = uc.WriteToUDPAddrPort(b, addr)
+		_, _ = uc.WriteToUDPAddrPort(b[headerLen:], addr)
 	}
 }

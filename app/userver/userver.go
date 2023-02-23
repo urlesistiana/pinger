@@ -48,16 +48,19 @@ func run(a *args) {
 		logger.Fatal("failed to bind on socket", zap.Error(err))
 	}
 	defer c.Close()
-	logger.Info("pinger pinger-server is started", zap.Stringer("addr", c.LocalAddr()))
+	logger.Info("pinger userver is started", zap.Stringer("addr", c.LocalAddr()))
 
 	uc := c.(*net.UDPConn)
+	checker := udp_pinger.AuthChecker{
+		Key: udp_pinger.Key32(a.auth),
+	}
 	go func() {
-		err := udp_pinger.Server(uc, a.auth)
+		err := udp_pinger.Server(uc, checker.CheckHeader)
 		logger.Fatal("pinger-server exited", zap.Error(err))
 	}()
 
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, os.Interrupt, syscall.SIGTERM)
 	sig := <-sc
-	logger.Info("pinger pinger-server is exiting", zap.Stringer("signal", sig))
+	logger.Info("pinger userver is exiting", zap.Stringer("signal", sig))
 }
